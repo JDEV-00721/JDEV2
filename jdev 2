@@ -1,0 +1,2515 @@
+
+
+import pandas as pd
+import numpy as np
+import dukascopy_python
+from dukascopy_python.instruments import INSTRUMENT_FX_MAJORS_AUD_USD
+from scipy.stats import norm, gamma, lognorm, stats
+from datetime import datetime, timedelta
+import time
+from numba import jit
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.inspection import permutation_importance
+from hmmlearn.hmm import GaussianHMM
+import matplotlib.pyplot as plt
+import warnings
+import dukascopy_python
+
+warnings.filterwarnings('ignore')
+
+# =========================================================
+# WALK FORWARD BACKTEST ANALYZER CLASS
+# =========================================================
+# =========================================================
+# STRESS TEST CONFIGURATION
+# =========================================================
+
+STRESS_GRID = {
+    "stop_loss_pct": [0.0008, 0.0010, 0.0012],
+    "take_profit_pct": [0.0020, 0.0030, 0.0040],
+    "forward_bars": [50, 100, 150],
+    "n_states": [3, 4, 5],
+    "min_win_rate": [0.25, 0.30, 0.35],
+}
+
+# -------------------------------------------------
+# STEP 2 GOES HERE
+# -------------------------------------------------
+def run_single_experiment(
+    df_features,
+    state_features,
+    params,
+    initial_capital=10000
+):
+    analyzer = WalkForwardBacktestAnalyzer(
+        initial_capital=initial_capital,
+        risk_free_rate=0.02
+    )
+
+    metrics = analyzer.walk_forward_analyze(
+        df=df_features,
+        state_features=state_features,
+        train_periods=12,
+        test_periods=3,
+        lookback_bars=20,
+        n_states=params["n_states"],
+        min_win_rate=params["min_win_rate"],
+        min_trades=5,
+        forward_bars=params["forward_bars"],
+        stop_loss_pct=params["stop_loss_pct"],
+        take_profit_pct=params["take_profit_pct"]
+    )
+
+    if metrics is None:
+        return None
+
+    return {
+        **params,
+        **flatten_metrics(metrics),
+        "total_trades": len(analyzer.trades),
+        "positive_folds": sum(
+            1 for f in analyzer.fold_metrics if f["total_return"] > 0
+        ),
+        "total_folds": len(analyzer.fold_metrics),
+    }
+
+# -------------------------------------------------
+# metric utilities
+# -------------------------------------------------
+def flatten_metrics(metrics):
+    flat = {}
+    for category, values in metrics.items():
+        for k, v in values.items():
+            flat[f"{category}.{k}"] = v
+    return flat
+
+
+class WalkForwardBacktestAnalyzer:
+    """
+    Walk-forward backtesting with rolling training/testing windows.
+    """
+
+    def __init__(self, initial_capital=10000, risk_free_rate=0.00):
+        self.initial_capital = initial_capital
+        self.risk_free_rate = risk_free_rate
+        self.metrics = {}
+        self.trades = None
+        self.equity_curve = None
+        self.feature_importance = None
+        self.walk_forward_results = []
+        self.fold_metrics = []
+
+    def walk_forward_analyze(self, df, state_features,
+                            train_periods=12, test_periods=3,
+                            lookback_bars=20, n_states=4,
+                            min_win_rate=0.30, min_trades=5,
+                            forward_bars=100, stop_loss_pct=0.001,
+                            take_profit_pct=0.003):
+        """
+        Perform walk-forward analysis with rolling windows.
+
+        Parameters:
+        -----------
+        df : DataFrame with features already computed
+        state_features : list of feature column names
+        train_periods : months to train on
+        test_periods : months to test on
+        """
+        print("\n" + "="*80)
+        print("🔄 WALK-FORWARD BACKTESTING")
+        print("="*80)
+        print(f"Train window: {train_periods} months | Test window: {test_periods} months")
+
+        df = df.copy()
+        df['timestamp'] = df.index
+
+        # Convert to monthly periods
+        df['year_month'] = df['timestamp'].dt.to_period('M')
+        unique_periods = sorted(df['year_month'].unique())
+
+        print(f"Total periods available: {len(unique_periods)}")
+
+        all_test_trades = []
+        fold_num = 0
+
+        # Rolling window loop
+        for i in range(len(unique_periods) - train_periods - test_periods + 1):
+            fold_num += 1
+
+            train_start_period = unique_periods[i]
+            train_end_period = unique_periods[i + train_periods - 1]
+            test_start_period = unique_periods[i + train_periods]
+            test_end_period = unique_periods[i + train_periods + test_periods - 1]
+
+            print(f"\n{'='*80}")
+            print(f"FOLD {fold_num}: Train [{train_start_period} to {train_end_period}] → Test [{test_start_period} to {test_end_period}]")
+            print(f"{'='*80}")
+
+            # Split data
+            train_mask = df['year_month'].between(train_start_period, train_end_period)
+            test_mask = df['year_month'].between(test_start_period, test_end_period)
+
+            df_train = df[train_mask].copy()
+            df_test = df[test_mask].copy()
+
+            print(f"Train samples: {len(df_train)} | Test samples: {len(df_test)}")
+
+            if len(df_train) < 100 or len(df_test) < 20:
+                print("⚠️ Insufficient data, skipping fold")
+                continue
+
+            # Label outcomes on training data
+            df_train = label_trade_outcomes(
+                df_train, forward_bars=forward_bars,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_pct=take_profit_pct
+            )
+
+            # Extract signal metadata from training
+            train_signal_mask = (df_train['final_buy'] == True) | (df_train['final_sell'] == True)
+            train_signal_metadata = df_train.loc[train_signal_mask,
+                ['trade_outcome', 'trade_return', 'bars_in_trade']].copy()
+
+            if len(train_signal_metadata) < 10:
+                print("⚠️ Too few training signals, skipping fold")
+                continue
+
+            # Fit HMM on training data
+            print(f"🧠 Training HMM on {len(train_signal_metadata)} signals...")
+            try:
+                hmm, scaler_hmm, train_signals_df, context_bars = fit_hmm_on_signal_context(
+                    df_train, state_features, train_signal_metadata,
+                    lookback_bars=lookback_bars, n_states=n_states
+                )
+            except Exception as e:
+                print(f"❌ HMM training failed: {e}")
+                continue
+
+            # Get regime statistics from training
+            regime_stats = summarize_regime_performance(train_signals_df)
+            print("\n📊 Training Regime Performance:")
+            print(regime_stats.to_string(index=False))
+
+            good_regimes = regime_stats[
+                (regime_stats['Win Rate (%)'] / 100 >= min_win_rate) &
+                (regime_stats['Trades'] >= min_trades)
+            ]['Regime'].values
+
+            print(f"\n✅ Good regimes (will trade): {good_regimes}")
+
+            if len(good_regimes) == 0:
+                print("⚠️ No good regimes found, skipping fold")
+                continue
+
+            # Apply model to TEST data
+            print(f"\n🎯 Applying model to test period...")
+            df_test = self._apply_regime_to_test(
+                df_test, hmm, scaler_hmm, state_features,
+                good_regimes, lookback_bars
+            )
+
+            # Label outcomes on test data
+            df_test = label_trade_outcomes(
+                df_test, forward_bars=forward_bars,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_pct=take_profit_pct
+            )
+
+            # Extract test trades
+            test_signal_mask = (df_test['regime_filtered_buy'] == True) | \
+                              (df_test['regime_filtered_sell'] == True)
+            test_trades = df_test[test_signal_mask].copy()
+
+            if len(test_trades) == 0:
+                print("⚠️ No test trades generated")
+                continue
+
+            test_trades['fold'] = fold_num
+            test_trades['train_start'] = str(train_start_period)
+            test_trades['train_end'] = str(train_end_period)
+            test_trades['test_start'] = str(test_start_period)
+            test_trades['test_end'] = str(test_end_period)
+
+            all_test_trades.append(test_trades)
+
+            # Calculate fold metrics
+            fold_win_rate = (test_trades['trade_outcome'] == 1).sum() / len(test_trades) * 100
+            fold_avg_return = test_trades['trade_return'].mean() * 100
+            fold_total_return = test_trades['trade_return'].sum() * 100
+
+            fold_result = {
+                'fold': fold_num,
+                'train_start': str(train_start_period),
+                'train_end': str(train_end_period),
+                'test_start': str(test_start_period),
+                'test_end': str(test_end_period),
+                'test_trades': len(test_trades),
+                'win_rate': fold_win_rate,
+                'avg_return': fold_avg_return,
+                'total_return': fold_total_return,
+                'good_regimes': ','.join(map(str, good_regimes))
+            }
+
+            self.walk_forward_results.append(fold_result)
+            self.fold_metrics.append(fold_result)
+
+            print(f"\n📈 Fold {fold_num} Results:")
+            print(f"  Trades: {len(test_trades)}")
+            print(f"  Win Rate: {fold_win_rate:.2f}%")
+            print(f"  Avg Return: {fold_avg_return:.3f}%")
+            print(f"  Total Return: {fold_total_return:.2f}%")
+
+        # Combine all test trades
+        if len(all_test_trades) == 0:
+            print("\n❌ No test trades generated across all folds!")
+            return None
+
+        self.trades = pd.concat(all_test_trades, ignore_index=False)
+        print(f"\n✅ Walk-forward complete: {len(self.trades)} total out-of-sample trades")
+
+        # Calculate overall metrics
+        self._build_equity_curve()
+        self._calc_performance_metrics()
+        self._calc_risk_metrics()
+        self._calc_behavioral_metrics()
+        self._calc_efficiency_metrics()
+        self._calc_advanced_metrics()
+
+        return self.metrics
+
+    def _apply_regime_to_test(self, df_test, hmm, scaler_hmm, state_features,
+                              good_regimes, lookback_bars):
+        """Apply trained HMM to test data and filter signals"""
+        df_test['signal_regime'] = -1
+
+        signal_mask = (df_test['final_buy'] == True) | (df_test['final_sell'] == True)
+        signal_indices = df_test[signal_mask].index
+
+        for signal_idx in signal_indices:
+            try:
+                signal_loc = df_test.index.get_loc(signal_idx)
+
+                if signal_loc < lookback_bars:
+                    continue
+
+                start_loc = signal_loc - lookback_bars
+                end_loc = signal_loc
+                context = df_test.iloc[start_loc:end_loc][state_features].copy()
+                context = context.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+                context_scaled = scaler_hmm.transform(context.values)
+                regime_sequence = hmm.predict(context_scaled)
+                regime = regime_sequence[-1]
+
+                df_test.loc[signal_idx, 'signal_regime'] = regime
+            except Exception as e:
+                print(f"⚠️ Error predicting regime for signal: {e}")
+                continue
+
+        df_test['regime_filtered_buy'] = (df_test['final_buy']) & \
+                                         (df_test['signal_regime'].isin(good_regimes))
+        df_test['regime_filtered_sell'] = (df_test['final_sell']) & \
+                                          (df_test['signal_regime'].isin(good_regimes))
+
+        return df_test
+
+    def _build_equity_curve(self):
+
+        equity = [self.initial_capital]
+        for ret in self.trades['trade_return']:
+            equity.append(equity[-1] * (1 + ret))
+        self.equity_curve = np.array(equity)
+
+    # time-aligned equity series (for Sharpe)
+        self.equity_curve_series = pd.Series(
+            self.equity_curve[1:],  # align with trades
+            index=self.trades.index
+        )
+
+    def _calc_performance_metrics(self):
+        returns = self.trades['trade_return'].values
+        wins = returns[returns > 0]
+        losses = returns[returns < 0]
+
+        net_profit = returns.sum() * self.initial_capital
+        gross_profit = wins.sum() * self.initial_capital if len(wins) > 0 else 0
+        gross_loss = abs(losses.sum() * self.initial_capital) if len(losses) > 0 else 0
+
+        win_rate = len(wins) / len(returns) * 100 if len(returns) > 0 else 0
+        avg_win = wins.mean() if len(wins) > 0 else 0
+        avg_loss = losses.mean() if len(losses) > 0 else 0
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
+
+        roi = (self.equity_curve[-1] - self.initial_capital) / self.initial_capital * 100
+
+        total_days = len(self.trades)
+        years = total_days / 252
+        cagr = (
+            ((self.equity_curve[-1] / self.initial_capital) ** (1 / years) - 1) * 100
+            if years > 0 else 0
+        )
+
+        loss_rate = len(losses) / len(returns) if len(returns) > 0 else 0
+        expectancy = (win_rate / 100 * avg_win) - (loss_rate * abs(avg_loss))
+
+        self.metrics['performance'] = {
+            'Net Profit ($)': net_profit,
+            'Gross Profit ($)': gross_profit,
+            'Gross Loss ($)': gross_loss,
+            'Win Rate (%)': win_rate,
+            'Average Win (%)': avg_win * 100,
+            'Average Loss (%)': avg_loss * 100,
+            'Profit Factor': profit_factor,
+            'ROI (%)': roi,
+            'CAGR (%)': cagr,
+            'Expectancy ($)': expectancy * self.initial_capital
+        }
+
+    def _calc_risk_metrics(self):
+        equity = self.equity_curve
+        returns = self.trades['trade_return'].values
+
+    # ======================
+    # DRAWDOWNS
+    # ======================
+        running_max = np.maximum.accumulate(equity)
+        drawdowns = (equity - running_max) / running_max * 100
+        max_dd = drawdowns.min()
+        avg_dd = drawdowns[drawdowns < 0].mean() if np.any(drawdowns < 0) else 0
+
+        in_dd = drawdowns < 0
+        dd_durations = []
+        current_dd_len = 0
+        for is_dd in in_dd:
+            if is_dd:
+                current_dd_len += 1
+            elif current_dd_len > 0:
+                dd_durations.append(current_dd_len)
+                current_dd_len = 0
+        avg_dd_duration = np.mean(dd_durations) if dd_durations else 0
+
+    # ======================
+    # TIME-BASED SHARPE
+    # ======================
+        equity_series = self.equity_curve_series
+        daily_equity = equity_series.resample('1D').last().ffill()
+        daily_returns = daily_equity.pct_change().dropna()
+
+        rf_daily = self.risk_free_rate / 252
+        excess_daily_returns = daily_returns - rf_daily
+
+        sharpe = (
+            excess_daily_returns.mean() / excess_daily_returns.std()
+        ) * np.sqrt(252) if excess_daily_returns.std() > 0 else 0
+
+        downside = excess_daily_returns[excess_daily_returns < 0]
+        downside_std = downside.std()
+        sortino = (
+            excess_daily_returns.mean() / downside_std
+        ) * np.sqrt(252) if downside_std > 0 else 0
+
+    # ======================
+    # OTHER RISK METRICS
+    # ======================
+        cagr = self.metrics['performance']['CAGR (%)']
+        calmar = abs(cagr / max_dd) if max_dd != 0 else np.inf
+
+        var_95 = np.percentile(returns, 5) * 100
+        cvar_95 = (
+            returns[returns <= np.percentile(returns, 5)].mean() * 100
+            if np.any(returns <= np.percentile(returns, 5)) else 0
+        )
+
+        self.metrics['risk'] = {
+            'Max Drawdown (%)': max_dd,
+            'Average Drawdown (%)': avg_dd,
+            'Avg DD Duration (trades)': avg_dd_duration,
+            'Sharpe Ratio': sharpe,
+            'Sortino Ratio': sortino,
+            'Calmar Ratio': calmar,
+            'VaR 95% (%)': var_95,
+            'CVaR 95% (%)': cvar_95
+        }
+    def _calc_efficiency_metrics(self):
+        returns = self.trades['trade_return'].values
+
+        # Bars held (fallback if column missing)
+        if 'bars_in_trade' in self.trades.columns:
+            bars_held = self.trades['bars_in_trade'].values
+        else:
+            bars_held = np.ones(len(returns))
+
+        trades_per_period = len(returns)
+        avg_bars_held = bars_held.mean() if len(bars_held) > 0 else 0
+        return_per_trade = returns.mean() * 100 if len(returns) > 0 else 0
+        volatility = returns.std() * 100 if len(returns) > 0 else 0
+
+        self.metrics['efficiency'] = {
+            'Total Trades': trades_per_period,
+            'Avg Bars Held': avg_bars_held,
+            'Return per Trade (%)': return_per_trade,
+            'Volatility of Returns (%)': volatility
+        }
+
+    def _calc_behavioral_metrics(self):
+        returns = self.trades['trade_return'].values
+
+        max_consec_wins = 0
+        max_consec_losses = 0
+        current_win_streak = 0
+        current_loss_streak = 0
+
+        for ret in returns:
+            if ret > 0:
+                current_win_streak += 1
+                current_loss_streak = 0
+                max_consec_wins = max(max_consec_wins, current_win_streak)
+            else:
+                current_loss_streak += 1
+                current_win_streak = 0
+                max_consec_losses = max(max_consec_losses, current_loss_streak)
+
+        self.metrics['behavioral'] = {
+            'Max Consecutive Wins': max_consec_wins,
+            'Max Consecutive Losses': max_consec_losses
+        }
+
+    def _calc_advanced_metrics(self):
+        returns = self.trades['trade_return'].values
+        equity = self.equity_curve
+
+        win_rate = len(returns[returns > 0]) / len(returns)
+        avg_win = returns[returns > 0].mean() if len(returns[returns > 0]) > 0 else 0
+        avg_loss = abs(returns[returns < 0].mean()) if len(returns[returns < 0]) > 0 else 0
+
+        if avg_loss > 0:
+            kelly = (win_rate * avg_win - (1 - win_rate) * avg_loss) / avg_win
+        else:
+            kelly = 0
+
+        running_max = np.maximum.accumulate(equity)
+        drawdowns = (equity - running_max) / running_max * 100
+        ulcer = np.sqrt(np.mean(drawdowns ** 2))
+
+        skewness = stats.skew(returns)
+        kurtosis = stats.kurtosis(returns)
+
+        self.metrics['advanced'] = {
+            'Kelly Fraction': kelly,
+            'Ulcer Index': ulcer,
+            'Skewness': skewness,
+            'Kurtosis': kurtosis
+        }
+
+    def print_report(self):
+        """Print comprehensive walk-forward results"""
+        print("\n" + "="*80)
+        print(" 📊 WALK-FORWARD BACKTEST PERFORMANCE REPORT")
+        print("="*80)
+
+        # Per-fold results
+        if self.fold_metrics:
+            print(f"\n{'='*80}")
+            print(" FOLD-BY-FOLD RESULTS")
+            print(f"{'='*80}")
+            fold_df = pd.DataFrame(self.fold_metrics)
+            print(fold_df.to_string(index=False))
+
+            print(f"\n{'='*80}")
+            print(" FOLD STATISTICS")
+            print(f"{'='*80}")
+            print(f"  Total Folds: {len(self.fold_metrics)}")
+            print(f"  Avg Win Rate: {fold_df['win_rate'].mean():.2f}%")
+            print(f"  Avg Trades per Fold: {fold_df['test_trades'].mean():.1f}")
+            print(f"  Positive Folds: {(fold_df['total_return'] > 0).sum()}/{len(fold_df)}")
+
+        # Overall metrics
+        for category, metrics in self.metrics.items():
+            print(f"\n{'='*80}")
+            print(f" {category.upper()} (ALL OUT-OF-SAMPLE TRADES)")
+            print(f"{'='*80}")
+            for name, value in metrics.items():
+                if isinstance(value, float):
+                    if 'ratio' in name.lower() or 'factor' in name.lower():
+                        print(f"  {name:.<50} {value:>12.3f}")
+                    else:
+                        print(f"  {name:.<50} {value:>12.2f}")
+                else:
+                    print(f"  {name:.<50} {value:>12}")
+
+        print("\n" + "="*80 + "\n")
+
+    def plot_walk_forward_results(self):
+        """Plot walk-forward specific visualizations"""
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+
+        # 1. Equity curve
+        axes[0, 0].plot(self.equity_curve, linewidth=2, color='steelblue')
+        axes[0, 0].axhline(self.initial_capital, color='red', linestyle='--', alpha=0.5)
+        axes[0, 0].set_title('Walk-Forward Equity Curve', fontsize=12, fontweight='bold')
+        axes[0, 0].set_xlabel('Trade #')
+        axes[0, 0].set_ylabel('Equity ($)')
+        axes[0, 0].grid(alpha=0.3)
+
+        # 2. Drawdown
+        running_max = np.maximum.accumulate(self.equity_curve)
+        drawdowns = (self.equity_curve - running_max) / running_max * 100
+        axes[0, 1].fill_between(range(len(drawdowns)), drawdowns, 0, color='red', alpha=0.3)
+        axes[0, 1].plot(drawdowns, color='darkred', linewidth=1.5)
+        axes[0, 1].set_title('Drawdown', fontsize=12, fontweight='bold')
+        axes[0, 1].set_xlabel('Trade #')
+        axes[0, 1].set_ylabel('Drawdown (%)')
+        axes[0, 1].grid(alpha=0.3)
+
+        # 3. Returns distribution
+        returns_pct = self.trades['trade_return'].values * 100
+        axes[0, 2].hist(returns_pct, bins=50, color='steelblue', alpha=0.7, edgecolor='black')
+        axes[0, 2].axvline(0, color='red', linestyle='--', linewidth=2)
+        axes[0, 2].set_title('Returns Distribution', fontsize=12, fontweight='bold')
+        axes[0, 2].set_xlabel('Return (%)')
+        axes[0, 2].set_ylabel('Frequency')
+        axes[0, 2].grid(alpha=0.3)
+
+        # 4. Per-fold performance
+        if self.fold_metrics:
+            fold_df = pd.DataFrame(self.fold_metrics)
+            axes[1, 0].bar(fold_df['fold'], fold_df['total_return'],
+                          color=['green' if x > 0 else 'red' for x in fold_df['total_return']], alpha=0.6)
+            axes[1, 0].axhline(0, color='black', linewidth=1)
+            axes[1, 0].set_title('Fold Returns', fontsize=12, fontweight='bold')
+            axes[1, 0].set_xlabel('Fold #')
+            axes[1, 0].set_ylabel('Total Return (%)')
+            axes[1, 0].grid(alpha=0.3)
+
+            # 5. Win rate by fold
+            axes[1, 1].plot(fold_df['fold'], fold_df['win_rate'], marker='o', linewidth=2, color='steelblue')
+            axes[1, 1].axhline(fold_df['win_rate'].mean(), color='red', linestyle='--', label='Average')
+            axes[1, 1].set_title('Win Rate by Fold', fontsize=12, fontweight='bold')
+            axes[1, 1].set_xlabel('Fold #')
+            axes[1, 1].set_ylabel('Win Rate (%)')
+            axes[1, 1].legend()
+            axes[1, 1].grid(alpha=0.3)
+
+        # 6. Cumulative returns
+        cumulative_returns = np.cumsum(self.trades['trade_return'].values) * 100
+        axes[1, 2].plot(cumulative_returns, color='steelblue', linewidth=2)
+        axes[1, 2].set_title('Cumulative Returns', fontsize=12, fontweight='bold')
+        axes[1, 2].set_xlabel('Trade #')
+        axes[1, 2].set_ylabel('Cumulative Return (%)')
+        axes[1, 2].grid(alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig('walkforward_backtest_analysis.png', dpi=150, bbox_inches='tight')
+        print("📊 Saved plot: walkforward_backtest_analysis.png")
+        plt.show()
+
+
+
+# =========================================================
+# DATA DOWNLOAD
+# =========================================================
+
+def get_dukascopy_chunked(pair_constant, start_date, end_date, interval, offer_side, chunk_months=1):
+    """Downloads OHLC + tick volume from Dukascopy in chunks."""
+    print(f"\n📥 Downloading data from Dukascopy in chunks…")
+    print(f"📅 Period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+
+    total_months = (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month)
+    num_chunks = max(1, (total_months // chunk_months) + 1)
+    print(f"🔢 Total period: ~{total_months} months | Chunks: {num_chunks}")
+
+    all_data = []
+    current_start = start_date
+
+    for i in range(num_chunks):
+        year_offset = (current_start.month + chunk_months - 1) // 12
+        month = ((current_start.month + chunk_months - 1) % 12) + 1
+        year = current_start.year + year_offset
+
+        try:
+            current_end = datetime(year, month, current_start.day)
+        except ValueError:
+            current_end = datetime(year, month, 28)
+
+        if current_end > end_date:
+            current_end = end_date
+
+        if current_start >= end_date:
+            break
+
+        print(f"\n📦 Chunk {i+1}/{num_chunks}: {current_start.strftime('%Y-%m-%d')} to {current_end.strftime('%Y-%m-%d')}")
+
+        try:
+            df_chunk = dukascopy_python.fetch(
+                pair_constant,
+                interval,
+                offer_side,
+                current_start,
+                current_end
+            )
+
+            if df_chunk is not None and not df_chunk.empty:
+                print(f" ✅ Downloaded {len(df_chunk)} rows")
+                all_data.append(df_chunk)
+            else:
+                print(f" ⚠️ No data returned for this chunk")
+
+            time.sleep(1)
+
+        except Exception as e:
+            print(f" ❌ Error downloading chunk: {e}")
+
+        current_start = current_end
+
+    if not all_data:
+        print("\n❌ No data downloaded!")
+        return pd.DataFrame()
+
+    print(f"\n🔗 Stitching {len(all_data)} chunks together...")
+    df_combined = pd.concat(all_data, ignore_index=False)
+    df_combined = df_combined[~df_combined.index.duplicated(keep='first')]
+    df_combined = df_combined.sort_index()
+    print(f"✅ Total rows after stitching: {len(df_combined)}")
+
+    return df_combined
+
+
+# =========================================================
+# NUMBA-ACCELERATED HELPER FUNCTIONS
+# =========================================================
+
+@jit(nopython=True)
+def fast_rolling_skew_kurt(arr, window):
+    """Ultra-fast rolling skewness and kurtosis"""
+    n = len(arr)
+    skew_out = np.full(n, np.nan)
+    kurt_out = np.full(n, np.nan)
+
+    for i in range(window - 1, n):
+        start = i - window + 1
+        vals = arr[start:i+1]
+        mean_val = np.mean(vals)
+        std_val = np.std(vals)
+
+        if std_val > 1e-10:
+            centered = vals - mean_val
+            m3 = np.mean(centered**3)
+            m4 = np.mean(centered**4)
+            skew_out[i] = m3 / (std_val**3)
+            kurt_out[i] = m4 / (std_val**4)
+
+    return skew_out, kurt_out
+
+@jit(nopython=True)
+def fast_last_true_index(bool_arr):
+    """Find last True index for each position"""
+    n = len(bool_arr)
+    result = np.full(n, np.nan)
+    last_idx = np.nan
+
+    for i in range(n):
+        if bool_arr[i]:
+            last_idx = float(i)
+        result[i] = last_idx
+
+    return result
+
+@jit(nopython=True)
+def fast_spike_tracking(vol_spike, max_gap=5):
+    """Track if spike occurred within last N bars"""
+    n = len(vol_spike)
+    last_spike_bar = np.full(n, np.nan)
+    spike_seen = np.zeros(n, dtype=np.bool_)
+    last_idx = np.nan
+
+    for i in range(n):
+        if vol_spike[i]:
+            last_idx = float(i)
+        last_spike_bar[i] = last_idx
+
+        if not np.isnan(last_idx) and (i - last_idx) <= max_gap:
+            spike_seen[i] = True
+
+    return last_spike_bar, spike_seen
+
+@jit(nopython=True)
+def fast_cooldown_filter(buy_cond, sell_cond, min_bars):
+    """Apply cooldown between signals"""
+    n = len(buy_cond)
+    final_buy = np.zeros(n, dtype=np.bool_)
+    final_sell = np.zeros(n, dtype=np.bool_)
+    last_signal_idx = -999
+
+    for i in range(n):
+        if buy_cond[i] or sell_cond[i]:
+            if (i - last_signal_idx) > min_bars:
+                if buy_cond[i]:
+                    final_buy[i] = True
+                else:
+                    final_sell[i] = True
+                last_signal_idx = i
+
+    return final_buy, final_sell
+
+
+# =========================================================
+# FEATURE COMPUTATION
+# =========================================================
+
+def compute_features_optimized(df, z_len=50, vol_len=50, base_z=1.8, alpha=0.1, beta=0.05,
+                                min_bars_between=5, require_vol_exhaustion=True, require_z_extreme=True):
+    """Ultra-fast feature computation"""
+    df = df.copy()
+    df.columns = [c.lower() for c in df.columns]
+
+    hlc3 = df[["high", "low", "close"]].mean(axis=1).values
+    volume = df["volume"].values
+    close_vals = df["close"].values
+    open_vals = df["open"].values
+
+    # Price Z-score
+    price_mean = pd.Series(hlc3).rolling(z_len, min_periods=z_len).mean().values
+    price_std = pd.Series(hlc3).rolling(z_len, min_periods=z_len).std().values
+    z_score = (hlc3 - price_mean) / (price_std + 1e-10)
+
+    # Volume stats
+    vol_mean = pd.Series(volume).rolling(vol_len, min_periods=vol_len).mean().values
+    vol_std = pd.Series(volume).rolling(vol_len, min_periods=vol_len).std().values
+    vol_skew, vol_kurt = fast_rolling_skew_kurt(volume, vol_len)
+    vol_jb = (vol_len / 6) * (vol_skew**2 + (vol_kurt - 3)**2 / 4)
+
+    # Distribution selection
+    dist = np.where(
+        vol_skew > 2.0, 0,
+        np.where((vol_skew > 1.0) & (vol_kurt > 6.0), 1,
+        np.where((vol_skew > 0.5) & (vol_jb > 10.0), 0,
+        np.where((np.abs(vol_skew) < 0.5) & (vol_kurt < 4.0) & (vol_jb < 6.0), 2,
+        np.where(vol_skew > 0.0, 1, 2)))))
+
+    # Distribution parameters
+    log_vol_mean = pd.Series(np.log(np.maximum(volume, 1))).rolling(vol_len).mean().values
+    log_vol_std = pd.Series(np.log(np.maximum(volume, 1))).rolling(vol_len).std().values
+    gamma_shape = (vol_mean**2) / (vol_std**2 + 1e-10)
+    gamma_scale = (vol_std**2) / (vol_mean + 1e-10)
+
+    # CDF computation
+    volume_prob = np.full(len(df), np.nan)
+
+    mask_normal = (dist == 2)
+    if mask_normal.any():
+        volume_prob[mask_normal] = norm.cdf(volume[mask_normal], vol_mean[mask_normal], vol_std[mask_normal] + 1e-10)
+
+    mask_lognorm = (dist == 0)
+    if mask_lognorm.any():
+        volume_prob[mask_lognorm] = lognorm.cdf(volume[mask_lognorm], log_vol_std[mask_lognorm], scale=np.exp(log_vol_mean[mask_lognorm]))
+
+    mask_gamma = (dist == 1)
+    if mask_gamma.any():
+        volume_prob[mask_gamma] = gamma.cdf(volume[mask_gamma], gamma_shape[mask_gamma], scale=gamma_scale[mask_gamma])
+
+    # Adaptive Z-score threshold
+    price_skew, price_kurt = fast_rolling_skew_kurt(hlc3, z_len)
+    avg_volatility = pd.Series(price_std).rolling(z_len).mean().values
+    vol_factor = price_std / (avg_volatility + 1e-10)
+    skew_factor = 1 + alpha * np.abs(price_skew)
+    excess_kurt = np.maximum(0, price_kurt - 3)
+    kurt_factor = 1 + beta * excess_kurt
+    adaptive_z = base_z * vol_factor * skew_factor * kurt_factor
+
+    # Volume spike & exhaustion
+    vol_spike_mult = 1.8
+    vol_spike = volume > vol_mean * vol_spike_mult
+    last_spike_bar, spike_seen = fast_spike_tracking(vol_spike, max_gap=5)
+    volume_exhaustion = spike_seen & (volume <= vol_mean * 1.3)
+
+    # Direction-aware volume events
+    vol_bar_is_up = close_vals > open_vals
+    vol_buy_event = volume_exhaustion & vol_bar_is_up
+    vol_sell_event = volume_exhaustion & ~vol_bar_is_up
+
+    # Z-score events
+    if require_z_extreme:
+        z_buy = z_score < -adaptive_z
+        z_sell = z_score > adaptive_z
+    else:
+        z_buy = z_score < -1.5
+        z_sell = z_score > 1.5
+
+    # Sync logic
+    window = 5
+    last_z_buy_bar = fast_last_true_index(z_buy)
+    last_z_sell_bar = fast_last_true_index(z_sell)
+    last_vol_buy_bar = fast_last_true_index(vol_buy_event)
+    last_vol_sell_bar = fast_last_true_index(vol_sell_event)
+
+    buy_z_valid = ~np.isnan(last_z_buy_bar)
+    buy_vol_valid = ~np.isnan(last_vol_buy_bar)
+    buy_gap = np.abs(last_z_buy_bar - last_vol_buy_bar)
+    is_buy_synced = buy_z_valid & buy_vol_valid & (buy_gap <= window)
+
+    sell_z_valid = ~np.isnan(last_z_sell_bar)
+    sell_vol_valid = ~np.isnan(last_vol_sell_bar)
+    sell_gap = np.abs(last_z_sell_bar - last_vol_sell_bar)
+    is_sell_synced = sell_z_valid & sell_vol_valid & (sell_gap <= window)
+
+    # Signal conditions
+    buy_condition = (z_buy | vol_buy_event) & is_buy_synced
+    sell_condition = (z_sell | vol_sell_event) & is_sell_synced
+
+    if require_vol_exhaustion:
+        buy_condition = buy_condition & volume_exhaustion
+        sell_condition = sell_condition & volume_exhaustion
+
+    # Cooldown filter
+    final_buy, final_sell = fast_cooldown_filter(buy_condition, sell_condition, min_bars_between)
+
+    # Build output
+    result = pd.DataFrame({
+        'hlc3': hlc3,
+        'price_mean': price_mean,
+        'price_std': price_std,
+        'z_score': z_score,
+        'volume': volume,
+        'vol_mean': vol_mean,
+        'vol_std': vol_std,
+        'vol_skew': vol_skew,
+        'vol_kurt': vol_kurt,
+        'vol_jb': vol_jb,
+        'dist': dist,
+        'volume_prob': volume_prob,
+        'adaptive_z': adaptive_z,
+        'volume_exhaustion': volume_exhaustion,
+        'vol_buy_event': vol_buy_event,
+        'vol_sell_event': vol_sell_event,
+        'z_buy': z_buy,
+        'z_sell': z_sell,
+        'is_buy_synced': is_buy_synced,
+        'is_sell_synced': is_sell_synced,
+        'final_buy': final_buy,
+        'final_sell': final_sell,
+        'open': df['open'],
+        'high': df['high'],
+        'low': df['low'],
+        'close': df['close']
+    }, index=df.index)
+
+    return result
+
+def label_trade_outcomes(
+        df,
+        forward_bars=100,
+        stop_loss_pct=0.001,      # 0.1% price move
+        take_profit_pct=0.003,    # 0.3% price move
+        risk_per_trade=0.0025,    # 0.25% account risk
+        spread_pips=0.4,
+        slippage_pips=0.7
+    ):
+    """
+    Labels trades with:
+      - percentage-based SL / TP
+      - fixed fractional risk sizing
+      - realistic FX execution costs
+    """
+
+    df = df.copy()
+    df['trade_outcome'] = 0
+    df['trade_return'] = 0.0
+    df['bars_in_trade'] = 0
+
+    # ============================================
+    # FX PIP MODEL (AUDUSD, EURUSD, GBPUSD)
+    # ============================================
+    pip_size = 0.0001
+
+    # execution cost in PRICE RETURN terms
+    execution_cost = (
+        (spread_pips * pip_size) +
+        (2 * slippage_pips * pip_size)
+    )
+
+    # ============================================
+    # POSITION SIZING (FIXED RISK MODEL)
+    # ============================================
+    position_size = risk_per_trade / stop_loss_pct
+    # guarantees: SL hit = -risk_per_trade
+
+    signals = df[(df['final_buy']) | (df['final_sell'])]
+
+    for idx in signals.index:
+        is_buy = df.at[idx, 'final_buy']
+        entry_price = df.at[idx, 'close']
+
+        start_loc = df.index.get_loc(idx) + 1
+        end_loc = min(start_loc + forward_bars, len(df))
+        future = df.iloc[start_loc:end_loc]
+
+        if future.empty:
+            continue
+
+        trade_return = 0.0
+        bars_held = 0
+        outcome = 0
+
+        # =====================================
+        # BUY LOGIC
+        # =====================================
+        if is_buy:
+            for i, row in enumerate(future.itertuples()):
+                ret = (row.close - entry_price) / entry_price
+
+                if ret <= -stop_loss_pct:
+                    trade_return = -stop_loss_pct
+                    outcome = -1
+                    bars_held = i + 1
+                    break
+
+                if ret >= take_profit_pct:
+                    trade_return = take_profit_pct
+                    outcome = 1
+                    bars_held = i + 1
+                    break
+
+            if outcome == 0:
+                final_close = future.iloc[-1].close
+                trade_return = (final_close - entry_price) / entry_price
+                outcome = 1 if trade_return > 0 else -1
+                bars_held = len(future)
+
+        # =====================================
+        # SELL LOGIC
+        # =====================================
+        else:
+            for i, row in enumerate(future.itertuples()):
+                ret = (entry_price - row.close) / entry_price
+
+                if ret <= -stop_loss_pct:
+                    trade_return = -stop_loss_pct
+                    outcome = -1
+                    bars_held = i + 1
+                    break
+
+                if ret >= take_profit_pct:
+                    trade_return = take_profit_pct
+                    outcome = 1
+                    bars_held = i + 1
+                    break
+
+            if outcome == 0:
+                final_close = future.iloc[-1].close
+                trade_return = (entry_price - final_close) / entry_price
+                outcome = 1 if trade_return > 0 else -1
+                bars_held = len(future)
+
+        # =====================================
+        # APPLY COSTS (PRICE SPACE)
+        # =====================================
+        trade_return -= execution_cost
+
+        # =====================================
+        # APPLY POSITION SIZING (CAPITAL SPACE)
+        # =====================================
+        trade_return *= position_size
+
+        df.at[idx, 'trade_outcome'] = outcome
+        df.at[idx, 'trade_return'] = trade_return
+        df.at[idx, 'bars_in_trade'] = bars_held
+
+    return df
+
+
+
+def extract_signal_states(df, lookback=50):
+    """Extract market state features"""
+    state_features = ['z_score', 'volume_prob', 'vol_skew', 'vol_kurt', 'adaptive_z',
+                      'volume_exhaustion', 'vol_mean', 'vol_std', 'price_std']
+
+    df['price_change_10'] = df['close'].pct_change(10)
+    df['price_change_50'] = df['close'].pct_change(50)
+    df['volume_change_10'] = df['volume'].pct_change(10)
+    df['recent_volatility'] = df['close'].pct_change().rolling(lookback).std()
+    df['recent_volume_spike'] = df['volume'] / df['volume'].rolling(lookback).mean()
+    df['z_score_abs_mean'] = df['z_score'].abs().rolling(lookback).mean()
+
+    state_features.extend(['price_change_10', 'price_change_50', 'volume_change_10',
+                          'recent_volatility', 'recent_volume_spike', 'z_score_abs_mean'])
+
+    return df, state_features
+
+
+# =========================================================
+# HMM REGIME DETECTION
+# =========================================================
+
+def extract_signal_context_windows(df, state_features, lookback_bars=20):
+    """Extract the N bars BEFORE each signal"""
+    signal_mask = (df['final_buy'] == True) | (df['final_sell'] == True)
+    signal_indices = df[signal_mask].index
+
+    context_windows = []
+    signal_metadata = []
+
+    for signal_idx in signal_indices:
+        signal_loc = df.index.get_loc(signal_idx)
+
+        if signal_loc < lookback_bars:
+            continue
+
+        start_loc = signal_loc - lookback_bars
+        end_loc = signal_loc
+        context_window = df.iloc[start_loc:end_loc].copy()
+
+        context_windows.append(context_window)
+
+        signal_row = df.loc[signal_idx]
+        signal_metadata.append({
+            'signal_index': signal_idx,
+            'signal_type': 'buy' if signal_row['final_buy'] else 'sell',
+            'trade_outcome': signal_row['trade_outcome'],
+            'trade_return': signal_row['trade_return'],
+            'bars_in_trade': signal_row['bars_in_trade']
+        })
+
+    all_context_bars = pd.concat(context_windows, ignore_index=False)
+    all_context_bars = all_context_bars[~all_context_bars.index.duplicated(keep='first')]
+
+    return all_context_bars, pd.DataFrame(signal_metadata)
+
+def fit_hmm_on_signal_context(features_df, state_features, signal_metadata, lookback_bars=20, n_states=4):
+    """Fit HMM on signal context windows"""
+    context_bars, metadata_df = extract_signal_context_windows(features_df, state_features, lookback_bars)
+
+    X_context = context_bars[state_features].copy()
+    X_context = X_context.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_context.values)
+
+    hmm = GaussianHMM(
+        n_components=n_states,
+        covariance_type='diag',
+        n_iter=100,
+        tol=1e-3,
+        verbose=False
+    )
+
+    hmm.fit(X_scaled)
+
+    # Predict regime for each signal
+    signals_df = metadata_df.copy()
+
+    for idx, row in signals_df.iterrows():
+        signal_idx = row['signal_index']
+        signal_loc = features_df.index.get_loc(signal_idx)
+
+        start_loc = signal_loc - lookback_bars
+        end_loc = signal_loc
+        context = features_df.iloc[start_loc:end_loc][state_features].copy()
+        context = context.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+        context_scaled = scaler.transform(context.values)
+        regime_sequence = hmm.predict(context_scaled)
+
+        signals_df.loc[idx, 'regime'] = regime_sequence[-1]
+
+    signals_df['regime'] = signals_df['regime'].astype(int)
+
+    return hmm, scaler, signals_df, context_bars
+
+def summarize_regime_performance(signals_df):
+    """Compute win rate + return stats for each regime"""
+    summary = []
+    for regime in sorted(signals_df['regime'].unique()):
+        subset = signals_df[signals_df['regime'] == regime]
+        summary.append({
+            'Regime': regime,
+            'Trades': len(subset),
+            'Win Rate (%)': 100 * (subset['trade_outcome'] == 1).mean(),
+            'Avg Return (%)': 100 * subset['trade_return'].mean(),
+            'Avg Bars Held': subset['bars_in_trade'].mean()
+        })
+    return pd.DataFrame(summary)
+
+# =========================================================
+# STRESS TEST DASHBOARD MODULE
+# Add this after the stress test completes
+# =========================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# =========================================================
+# CORE DIAGNOSTIC METRICS
+# =========================================================
+
+CORE_METRICS = {
+    "expectancy": "performance.Expectancy ($)",
+    "sharpe": "risk.Sharpe Ratio",
+    "max_dd": "risk.Max Drawdown (%)",
+    "cvar": "risk.CVaR 95% (%)",
+    "profit_factor": "performance.Profit Factor",
+    "win_rate": "performance.Win Rate (%)",
+}
+
+# =========================================================
+# UTILITY FUNCTIONS
+# =========================================================
+
+def split_params_metrics(stress_df):
+    """Separate control parameters from outcome metrics"""
+    metric_cols = [c for c in stress_df.columns if '.' in c]
+    param_cols = [c for c in stress_df.columns if c not in metric_cols]
+    return stress_df[param_cols], stress_df[metric_cols]
+
+# =========================================================
+# DASHBOARD 1: EXPECTANCY SENSITIVITY
+# =========================================================
+
+def expectancy_sensitivity(stress_df, param):
+    """
+    Which stress slices hurt expectancy?
+
+    Interpretation:
+    - Large mean swings → fragile
+    - Flat means → robust
+    - High std with flat mean → noise
+    """
+    return (
+        stress_df
+        .groupby(param)[CORE_METRICS["expectancy"]]
+        .agg(["mean", "std", "count"])
+        .sort_values("mean")
+    )
+
+# =========================================================
+# DASHBOARD 2: TAIL VS MEAN ANALYSIS
+# =========================================================
+
+def tail_vs_mean(stress_df, param):
+    """
+    Which hurt tails but not the mean?
+
+    Key pattern to look for:
+    - Expectancy ≈ stable
+    - CVaR / DD worsens sharply
+
+    ➡️ This becomes a risk filter, not a signal filter
+    """
+    g = stress_df.groupby(param)
+
+    return pd.DataFrame({
+        "Expectancy Mean": g[CORE_METRICS["expectancy"]].mean(),
+        "CVaR Mean": g[CORE_METRICS["cvar"]].mean(),
+        "Max DD Mean": g[CORE_METRICS["max_dd"]].mean(),
+        "Sharpe Mean": g[CORE_METRICS["sharpe"]].mean(),
+    }).sort_values("CVaR Mean")
+
+# =========================================================
+# DASHBOARD 3: NOISE SCORE
+# =========================================================
+
+def noise_score(stress_df, param):
+    """
+    Which are just noise?
+
+    Noise = parameter changes that do nothing meaningful.
+
+    Interpretation:
+    - Low score → irrelevant parameter
+    - High score → unstable lever
+
+    You freeze noisy parameters, never tune them
+    """
+    g = stress_df.groupby(param)[CORE_METRICS["expectancy"]]
+    return g.std() / g.mean().abs()
+
+# =========================================================
+# DASHBOARD 4: SURVIVABILITY TABLE
+# =========================================================
+
+def survivability_table(stress_df):
+    """
+    Which are regime-consistent with my thesis?
+
+    Your thesis:
+    - Low frequency
+    - Regime-filtered
+    - Tail-harvesting
+    - Capital-preserving
+
+    This tells you:
+    - Which regimes don't collapse
+    - Which configs are structurally unsafe
+    """
+    return stress_df.assign(
+        survives = (
+            (stress_df[CORE_METRICS["expectancy"]] > 0) &
+            (stress_df[CORE_METRICS["sharpe"]] > 0.5) &
+            (stress_df[CORE_METRICS["max_dd"]] > -25)
+        )
+    ).groupby("n_states")["survives"].mean()
+
+# =========================================================
+# EXECUTIVE SUMMARY
+# =========================================================
+
+def stress_dashboard_summary(stress_df):
+    """
+    One-page executive summary
+
+    This is what you look at, not Twitter.
+    """
+    param_cols = ["stop_loss_pct", "take_profit_pct", "forward_bars", "n_states"]
+
+    # Find most fragile parameter
+    noise_scores = {}
+    for p in param_cols:
+        try:
+            score = noise_score(stress_df, p)
+            if isinstance(score, pd.Series):
+                noise_scores[p] = score.mean()
+            else:
+                noise_scores[p] = score
+        except:
+            noise_scores[p] = 0
+
+    most_fragile = max(noise_scores, key=noise_scores.get)
+
+    # Find most stable SL
+    try:
+        sl_stability = expectancy_sensitivity(stress_df, "stop_loss_pct")
+        most_stable_sl = sl_stability["std"].idxmin()
+    except:
+        most_stable_sl = "N/A"
+
+    return {
+        "Best Expectancy Universe":
+            stress_df.sort_values(CORE_METRICS["expectancy"], ascending=False).head(1),
+
+        "Worst Tail Risk Universe":
+            stress_df.sort_values(CORE_METRICS["cvar"]).head(1),
+
+        "Most Stable SL": most_stable_sl,
+
+        "Most Fragile Parameter": most_fragile,
+
+        "Noise Scores": noise_scores
+    }
+
+# =========================================================
+# COMPREHENSIVE DASHBOARD REPORT
+# =========================================================
+
+def print_stress_dashboard(stress_df):
+    """
+    Print comprehensive stress test analysis
+
+    This is read-only introspection.
+    You are ranking failure modes, not choosing parameters.
+    """
+    print("\n" + "="*80)
+    print("🔍 STRESS TEST DASHBOARD - FRAGILITY ANALYSIS")
+    print("="*80)
+    print("\n📊 Mental Model:")
+    print("  stress_df = many universes")
+    print("  Dashboard = cross-sectional diagnostics")
+    print("  We are detecting fragility, not selecting winners")
+
+    param_cols = ["stop_loss_pct", "take_profit_pct", "forward_bars", "n_states"]
+
+    # =========================================================
+    # 1. EXPECTANCY SENSITIVITY
+    # =========================================================
+    print("\n" + "="*80)
+    print("📈 DASHBOARD 1: EXPECTANCY SENSITIVITY")
+    print("="*80)
+    print("Which stress slices hurt expectancy?")
+    print()
+
+    for param in param_cols:
+        print(f"\n--- {param} ---")
+        try:
+            sens = expectancy_sensitivity(stress_df, param)
+            print(sens)
+        except Exception as e:
+            print(f"Error: {e}")
+
+    # =========================================================
+    # 2. TAIL VS MEAN
+    # =========================================================
+    print("\n" + "="*80)
+    print("⚠️  DASHBOARD 2: TAIL VS MEAN ANALYSIS")
+    print("="*80)
+    print("Which hurt tails but not the mean?")
+    print("(Most important table)")
+    print()
+
+    for param in param_cols:
+        print(f"\n--- {param} ---")
+        try:
+            tail_analysis = tail_vs_mean(stress_df, param)
+            print(tail_analysis)
+        except Exception as e:
+            print(f"Error: {e}")
+
+    # =========================================================
+    # 3. NOISE SCORES
+    # =========================================================
+    print("\n" + "="*80)
+    print("🎲 DASHBOARD 3: NOISE SCORES")
+    print("="*80)
+    print("Which are just noise?")
+    print()
+
+    noise_scores = {}
+    for param in param_cols:
+        try:
+            score = noise_score(stress_df, param)
+            if isinstance(score, pd.Series):
+                noise_scores[param] = score.mean()
+            else:
+                noise_scores[param] = score
+            print(f"{param:.<30} {noise_scores[param]:.4f}")
+        except Exception as e:
+            print(f"{param:.<30} Error: {e}")
+
+    print("\nInterpretation:")
+    print("  Low score  → irrelevant parameter (freeze it)")
+    print("  High score → unstable lever (dangerous)")
+
+    # =========================================================
+    # 4. SURVIVABILITY
+    # =========================================================
+    print("\n" + "="*80)
+    print("🛡️  DASHBOARD 4: SURVIVABILITY TABLE")
+    print("="*80)
+    print("Which are regime-consistent with thesis?")
+    print()
+
+    try:
+        surv = survivability_table(stress_df)
+        print(surv)
+        print("\nSurvivability = (Expectancy > 0) & (Sharpe > 0.5) & (MaxDD > -25%)")
+    except Exception as e:
+        print(f"Error: {e}")
+
+    # =========================================================
+    # 5. EXECUTIVE SUMMARY
+    # =========================================================
+    print("\n" + "="*80)
+    print("📋 EXECUTIVE SUMMARY")
+    print("="*80)
+
+    try:
+        summary = stress_dashboard_summary(stress_df)
+
+        print("\n🏆 Best Expectancy Universe:")
+        print(summary["Best Expectancy Universe"].to_string())
+
+        print("\n💀 Worst Tail Risk Universe:")
+        print(summary["Worst Tail Risk Universe"].to_string())
+
+        print(f"\n✅ Most Stable Stop Loss: {summary['Most Stable SL']}")
+        print(f"⚠️  Most Fragile Parameter: {summary['Most Fragile Parameter']}")
+
+        print("\n📊 All Noise Scores:")
+        for param, score in summary["Noise Scores"].items():
+            print(f"  {param:.<30} {score:.4f}")
+
+    except Exception as e:
+        print(f"Error generating summary: {e}")
+
+    print("\n" + "="*80)
+    print("🎯 WHAT TO DO NEXT")
+    print("="*80)
+    print("\n❌ DO NOT YET:")
+    print("  - Pick 'best' parameters")
+    print("  - Change live logic")
+    print("  - Refit HMMs")
+    print("  - Block trades")
+    print("\n✅ YOU ARE OBSERVING")
+    print("  - Which parameters are fragile?")
+    print("  - Which hurt tails but not mean?")
+    print("  - Which are just noise?")
+    print("\n🔜 ONLY AFTER THIS TELLS A COHERENT STORY:")
+    print("  - Promote tail-damaging slices → soft filters")
+    print("  - Log regime-fragile conditions")
+    print("  - Cap size instead of blocking trades")
+    print("\n" + "="*80)
+
+# =========================================================
+# VISUALIZATION SUITE
+# =========================================================
+
+def plot_stress_heatmaps(stress_df):
+    """
+    Generate heatmaps for key metric sensitivity
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+    # Get parameter columns
+    param_cols = ["stop_loss_pct", "take_profit_pct", "forward_bars", "n_states"]
+
+    # 1. Expectancy heatmap
+    try:
+        pivot = stress_df.pivot_table(
+            values=CORE_METRICS["expectancy"],
+            index="stop_loss_pct",
+            columns="take_profit_pct",
+            aggfunc='mean'
+        )
+        sns.heatmap(pivot, annot=True, fmt='.0f', cmap='RdYlGn',
+                   ax=axes[0, 0], cbar_kws={'label': 'Expectancy ($)'})
+        axes[0, 0].set_title('Expectancy: SL vs TP', fontweight='bold')
+    except Exception as e:
+        axes[0, 0].text(0.5, 0.5, f'Error: {e}', ha='center', va='center')
+
+    # 2. Sharpe heatmap
+    try:
+        pivot = stress_df.pivot_table(
+            values=CORE_METRICS["sharpe"],
+            index="forward_bars",
+            columns="n_states",
+            aggfunc='mean'
+        )
+        sns.heatmap(pivot, annot=True, fmt='.2f', cmap='RdYlGn',
+                   ax=axes[0, 1], cbar_kws={'label': 'Sharpe Ratio'})
+        axes[0, 1].set_title('Sharpe Ratio: Forward Bars vs States', fontweight='bold')
+    except Exception as e:
+        axes[0, 1].text(0.5, 0.5, f'Error: {e}', ha='center', va='center')
+
+    # 3. Max DD heatmap
+    try:
+        pivot = stress_df.pivot_table(
+            values=CORE_METRICS["max_dd"],
+            index="stop_loss_pct",
+            columns="forward_bars",
+            aggfunc='mean'
+        )
+        sns.heatmap(pivot, annot=True, fmt='.1f', cmap='RdYlGn_r',
+                   ax=axes[1, 0], cbar_kws={'label': 'Max DD (%)'})
+        axes[1, 0].set_title('Max Drawdown: SL vs Forward Bars', fontweight='bold')
+    except Exception as e:
+        axes[1, 0].text(0.5, 0.5, f'Error: {e}', ha='center', va='center')
+
+    # 4. CVaR heatmap
+    try:
+        pivot = stress_df.pivot_table(
+            values=CORE_METRICS["cvar"],
+            index="take_profit_pct",
+            columns="n_states",
+            aggfunc='mean'
+        )
+        sns.heatmap(pivot, annot=True, fmt='.2f', cmap='RdYlGn_r',
+                   ax=axes[1, 1], cbar_kws={'label': 'CVaR 95% (%)'})
+        axes[1, 1].set_title('CVaR: TP vs States', fontweight='bold')
+    except Exception as e:
+        axes[1, 1].text(0.5, 0.5, f'Error: {e}', ha='center', va='center')
+
+    plt.tight_layout()
+    plt.savefig('stress_test_heatmaps.png', dpi=150, bbox_inches='tight')
+    print("\n📊 Saved: stress_test_heatmaps.png")
+    plt.show()
+
+def plot_parameter_sensitivity(stress_df):
+    """
+    Box plots showing distribution of key metrics across parameter values
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+
+    param_cols = ["stop_loss_pct", "take_profit_pct", "forward_bars", "n_states"]
+
+    for idx, param in enumerate(param_cols):
+        ax = axes[idx // 2, idx % 2]
+
+        try:
+            # Plot expectancy distribution for each parameter value
+            data = []
+            labels = []
+            for val in sorted(stress_df[param].unique()):
+                subset = stress_df[stress_df[param] == val][CORE_METRICS["expectancy"]]
+                data.append(subset)
+                labels.append(str(val))
+
+            bp = ax.boxplot(data, labels=labels, patch_artist=True)
+
+            # Color boxes
+            for patch in bp['boxes']:
+                patch.set_facecolor('lightblue')
+
+            ax.axhline(0, color='red', linestyle='--', alpha=0.5)
+            ax.set_title(f'Expectancy Distribution by {param}', fontweight='bold')
+            ax.set_xlabel(param)
+            ax.set_ylabel('Expectancy ($)')
+            ax.grid(alpha=0.3)
+
+        except Exception as e:
+            ax.text(0.5, 0.5, f'Error: {e}', ha='center', va='center')
+
+    plt.tight_layout()
+    plt.savefig('stress_test_sensitivity.png', dpi=150, bbox_inches='tight')
+    print("📊 Saved: stress_test_sensitivity.png")
+    plt.show()
+
+def run_experiment_wrapper(args):
+    """
+    Top-level wrapper required for multiprocessing pickling
+    """
+    df_features, state_features, params = args
+    try:
+        return run_single_experiment(
+            df_features=df_features,
+            state_features=state_features,
+            params=params,
+            initial_capital=10000
+        )
+    except Exception as e:
+        print(f"❌ Failed {params}: {e}")
+        return None
+
+# =========================================================
+# MAIN DASHBOARD FUNCTION
+# =========================================================
+# =========================================================
+# ENHANCED STRESS TEST EXTRACTION & MONTE CARLO SUITE
+# =========================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from itertools import combinations
+import warnings
+warnings.filterwarnings('ignore')
+
+# =========================================================
+# PART 1: DEEP STRESS TEST EXTRACTION
+# =========================================================
+
+class StressTestAnalyzer:
+    """
+    Extract maximum insight from stress test results
+    """
+    
+    def __init__(self, stress_df):
+        self.df = stress_df.copy()
+        self.param_cols = ["stop_loss_pct", "take_profit_pct", "forward_bars", 
+                          "n_states", "min_win_rate"]
+        self.metric_cols = [c for c in self.df.columns if '.' in c]
+        
+    # =========================================================
+    # 1. PARAMETER INTERACTION ANALYSIS
+    # =========================================================
+    
+    def analyze_parameter_interactions(self):
+        """
+        Find which parameter combinations amplify/dampen each other
+        
+        Example: Does wide SL + narrow TP = disaster?
+        """
+        print("\n" + "="*80)
+        print("🔗 PARAMETER INTERACTION ANALYSIS")
+        print("="*80)
+        
+        interactions = []
+        
+        # Test all 2-way interactions
+        for p1, p2 in combinations(self.param_cols, 2):
+            try:
+                grouped = self.df.groupby([p1, p2])['performance.Expectancy ($)'].mean()
+                
+                # Check if interaction matters
+                variance_ratio = grouped.std() / self.df['performance.Expectancy ($)'].std()
+                
+                interactions.append({
+                    'param1': p1,
+                    'param2': p2,
+                    'variance_explained': variance_ratio,
+                    'best_combo': grouped.idxmax(),
+                    'worst_combo': grouped.idxmin(),
+                    'spread': grouped.max() - grouped.min()
+                })
+            except:
+                continue
+        
+        interaction_df = pd.DataFrame(interactions).sort_values(
+            'variance_explained', ascending=False
+        )
+        
+        print("\nTop Parameter Interactions (ranked by variance explained):")
+        print(interaction_df.head(10).to_string(index=False))
+        
+        return interaction_df
+    
+    # =========================================================
+    # 2. REGIME CONSISTENCY ANALYSIS
+    # =========================================================
+    
+    def analyze_regime_consistency(self):
+        """
+        Which parameter sets work across ALL folds vs just lucky ones?
+        """
+        print("\n" + "="*80)
+        print("🎯 REGIME CONSISTENCY ANALYSIS")
+        print("="*80)
+        
+        if 'positive_folds' not in self.df.columns or 'total_folds' not in self.df.columns:
+            print("⚠️ Fold data not available")
+            return None
+        
+        self.df['consistency_ratio'] = self.df['positive_folds'] / self.df['total_folds']
+        
+        # High expectancy + high consistency = robust
+        # High expectancy + low consistency = lucky
+        
+        self.df['regime_score'] = (
+            self.df['performance.Expectancy ($)'] * 
+            self.df['consistency_ratio']
+        )
+        
+        print("\nMost Consistent Performers (work across regimes):")
+        top_consistent = self.df.nlargest(10, 'regime_score')[
+            self.param_cols + ['performance.Expectancy ($)', 
+                              'consistency_ratio', 'positive_folds', 'total_folds']
+        ]
+        print(top_consistent.to_string(index=False))
+        
+        print("\nLucky vs Robust:")
+        lucky = self.df[
+            (self.df['performance.Expectancy ($)'] > 0) & 
+            (self.df['consistency_ratio'] < 0.5)
+        ]
+        print(f"  Lucky configs (high return, low consistency): {len(lucky)}")
+        
+        robust = self.df[
+            (self.df['performance.Expectancy ($)'] > 0) & 
+            (self.df['consistency_ratio'] > 0.7)
+        ]
+        print(f"  Robust configs (high return, high consistency): {len(robust)}")
+        
+        return self.df
+    
+    # =========================================================
+    # 3. TAIL RISK DECOMPOSITION
+    # =========================================================
+    
+    def decompose_tail_risk(self):
+        """
+        Separate tail risk into:
+        1. Frequency risk (how often you lose)
+        2. Magnitude risk (how much you lose when you do)
+        """
+        print("\n" + "="*80)
+        print("📉 TAIL RISK DECOMPOSITION")
+        print("="*80)
+        
+        win_rate = self.df['performance.Win Rate (%)']
+        avg_loss = self.df['performance.Average Loss (%)']
+        max_dd = self.df['risk.Max Drawdown (%)']
+        
+        # Frequency component
+        self.df['frequency_risk'] = 100 - win_rate
+        
+        # Magnitude component  
+        self.df['magnitude_risk'] = avg_loss.abs()
+        
+        # Combined tail score
+        self.df['tail_risk_score'] = (
+            self.df['frequency_risk'] * self.df['magnitude_risk']
+        )
+        
+        print("\nTail Risk Components:")
+        summary = self.df[['frequency_risk', 'magnitude_risk', 
+                           'tail_risk_score', 'risk.Max Drawdown (%)']].describe()
+        print(summary)
+        
+        # Find which parameters drive which component
+        print("\nFrequency Risk Drivers:")
+        for param in self.param_cols:
+            corr = self.df[param].astype(float).corr(self.df['frequency_risk'])
+            print(f"  {param:.<30} {corr:>8.3f}")
+        
+        print("\nMagnitude Risk Drivers:")
+        for param in self.param_cols:
+            corr = self.df[param].astype(float).corr(self.df['magnitude_risk'])
+            print(f"  {param:.<30} {corr:>8.3f}")
+        
+        return self.df
+    
+    # =========================================================
+    # 4. EFFICIENCY FRONTIER
+    # =========================================================
+    
+    def plot_efficiency_frontier(self):
+        """
+        Risk-return tradeoff: Pareto frontier of configs
+        """
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+        
+        # 1. Expectancy vs Max Drawdown
+        ax = axes[0]
+        scatter = ax.scatter(
+            self.df['risk.Max Drawdown (%)'],
+            self.df['performance.Expectancy ($)'],
+            c=self.df['performance.Win Rate (%)'],
+            cmap='RdYlGn',
+            alpha=0.6,
+            s=50
+        )
+        
+        # Mark Pareto frontier
+        pareto_mask = self.is_pareto_efficient(
+            self.df[['risk.Max Drawdown (%)', 'performance.Expectancy ($)']].values,
+            maximize=[False, True]  # minimize DD, maximize expectancy
+        )
+        
+        pareto_points = self.df[pareto_mask]
+        ax.scatter(
+            pareto_points['risk.Max Drawdown (%)'],
+            pareto_points['performance.Expectancy ($)'],
+            color='red',
+            s=200,
+            marker='*',
+            label='Pareto Optimal',
+            edgecolors='black',
+            linewidths=2
+        )
+        
+        ax.axhline(0, color='black', linestyle='--', alpha=0.3)
+        ax.set_xlabel('Max Drawdown (%)', fontsize=12)
+        ax.set_ylabel('Expectancy ($)', fontsize=12)
+        ax.set_title('Efficiency Frontier: Return vs Risk', fontsize=14, fontweight='bold')
+        ax.legend()
+        ax.grid(alpha=0.3)
+        plt.colorbar(scatter, ax=ax, label='Win Rate (%)')
+        
+        # 2. Sharpe vs Consistency
+        ax = axes[1]
+        if 'consistency_ratio' in self.df.columns:
+            scatter = ax.scatter(
+                self.df['consistency_ratio'],
+                self.df['risk.Sharpe Ratio'],
+                c=self.df['performance.Expectancy ($)'],
+                cmap='RdYlGn',
+                alpha=0.6,
+                s=50
+            )
+            ax.set_xlabel('Consistency Ratio (Positive Folds / Total)', fontsize=12)
+            ax.set_ylabel('Sharpe Ratio', fontsize=12)
+            ax.set_title('Robustness: Sharpe vs Consistency', fontsize=14, fontweight='bold')
+            ax.grid(alpha=0.3)
+            plt.colorbar(scatter, ax=ax, label='Expectancy ($)')
+        
+        plt.tight_layout()
+        plt.savefig('stress_efficiency_frontier.png', dpi=150, bbox_inches='tight')
+        print("\n📊 Saved: stress_efficiency_frontier.png")
+        plt.show()
+        
+        print(f"\n🌟 Found {pareto_mask.sum()} Pareto-optimal configurations")
+        print("\nPareto Optimal Configs:")
+        print(pareto_points[self.param_cols + ['performance.Expectancy ($)', 
+                                                'risk.Max Drawdown (%)']].to_string(index=False))
+        
+        return pareto_points
+    
+    @staticmethod
+    def is_pareto_efficient(costs, maximize=None):
+        """
+        Find Pareto frontier
+        costs: (n_points, n_costs) array
+        maximize: list of bools indicating which to maximize
+        """
+        if maximize is None:
+            maximize = [True] * costs.shape[1]
+        
+        # Flip signs for maximization objectives
+        costs_adj = costs.copy()
+        for i, max_flag in enumerate(maximize):
+            if max_flag:
+                costs_adj[:, i] = -costs_adj[:, i]
+        
+        is_efficient = np.ones(costs_adj.shape[0], dtype=bool)
+        for i, c in enumerate(costs_adj):
+            if is_efficient[i]:
+                # Remove dominated points
+                is_efficient[is_efficient] = np.any(
+                    costs_adj[is_efficient] < c, axis=1
+                )
+                is_efficient[i] = True
+        
+        return is_efficient
+    
+    # =========================================================
+    # 5. CORRELATION MATRIX
+    # =========================================================
+    
+    def plot_metric_correlations(self):
+        """
+        Which metrics move together?
+        """
+        key_metrics = [
+            'performance.Expectancy ($)',
+            'performance.Win Rate (%)',
+            'performance.Profit Factor',
+            'risk.Sharpe Ratio',
+            'risk.Max Drawdown (%)',
+            'risk.CVaR 95% (%)',
+            'efficiency.Total Trades',
+        ]
+        
+        available_metrics = [m for m in key_metrics if m in self.df.columns]
+        
+        if len(available_metrics) < 2:
+            print("⚠️ Insufficient metrics for correlation analysis")
+            return
+        
+        corr_matrix = self.df[available_metrics].corr()
+        
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(
+            corr_matrix,
+            annot=True,
+            fmt='.2f',
+            cmap='coolwarm',
+            center=0,
+            square=True,
+            linewidths=1
+        )
+        plt.title('Metric Correlation Matrix', fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig('stress_metric_correlations.png', dpi=150, bbox_inches='tight')
+        print("\n📊 Saved: stress_metric_correlations.png")
+        plt.show()
+        
+        print("\nKey Insights:")
+        print(f"Expectancy-Sharpe correlation: {corr_matrix.loc['performance.Expectancy ($)', 'risk.Sharpe Ratio']:.3f}")
+        print(f"Drawdown-CVaR correlation: {corr_matrix.loc['risk.Max Drawdown (%)', 'risk.CVaR 95% (%)']:.3f}")
+
+# =========================================================
+# PART 2: MONTE CARLO SIMULATION SUITE
+# =========================================================
+
+class MonteCarloSimulator:
+    """
+    Monte Carlo simulation for:
+    1. Future path distributions
+    2. Risk of ruin
+    3. Drawdown probability
+    4. Portfolio heat analysis
+    """
+    
+    def __init__(self, trades_df, initial_capital=10000):
+        """
+        trades_df: DataFrame with 'trade_return' column
+        """
+        self.trades = trades_df.copy()
+        self.initial_capital = initial_capital
+        self.returns = trades_df['trade_return'].values
+        
+        print(f"\n📊 Monte Carlo Simulator Initialized")
+        print(f"  Historical trades: {len(self.returns)}")
+        print(f"  Mean return: {self.returns.mean()*100:.3f}%")
+        print(f"  Std return: {self.returns.std()*100:.3f}%")
+    
+    # =========================================================
+    # 1. BOOTSTRAP RESAMPLING
+    # =========================================================
+    
+    def bootstrap_paths(self, n_simulations=1000, n_trades=None, 
+                       with_replacement=True, preserve_order=False):
+        """
+        Generate alternate histories by resampling actual trades
+        
+        Parameters:
+        -----------
+        n_simulations: number of alternate paths
+        n_trades: length of each path (default: same as historical)
+        with_replacement: bootstrap vs permutation
+        preserve_order: maintain sequential dependency
+        """
+        if n_trades is None:
+            n_trades = len(self.returns)
+        
+        print(f"\n🎲 Running {n_simulations} bootstrap simulations...")
+        print(f"  Trades per path: {n_trades}")
+        print(f"  Sampling: {'with' if with_replacement else 'without'} replacement")
+        
+        paths = []
+        
+        for i in range(n_simulations):
+            if with_replacement:
+                if preserve_order:
+                    # Block bootstrap (preserve sequences)
+                    block_size = 10
+                    n_blocks = n_trades // block_size
+                    path = []
+                    for _ in range(n_blocks):
+                        start_idx = np.random.randint(0, len(self.returns) - block_size)
+                        path.extend(self.returns[start_idx:start_idx + block_size])
+                    path = np.array(path[:n_trades])
+                else:
+                    # Standard bootstrap
+                    path = np.random.choice(self.returns, size=n_trades, replace=True)
+            else:
+                # Permutation (shuffle)
+                path = np.random.permutation(self.returns)[:n_trades]
+            
+            paths.append(path)
+        
+        self.simulated_paths = np.array(paths)
+        return self.simulated_paths
+    
+    # =========================================================
+    # 2. PARAMETRIC MONTE CARLO
+    # =========================================================
+    
+    def parametric_paths(self, n_simulations=1000, n_trades=None, 
+                        distribution='normal'):
+        """
+        Generate paths from fitted distribution
+        
+        Distributions:
+        - 'normal': Gaussian
+        - 't': Student's t (fat tails)
+        - 'mixture': Normal mixture (regime-switching)
+        """
+        if n_trades is None:
+            n_trades = len(self.returns)
+        
+        print(f"\n🎲 Running {n_simulations} parametric simulations...")
+        print(f"  Distribution: {distribution}")
+        
+        mu = self.returns.mean()
+        sigma = self.returns.std()
+        
+        paths = []
+        
+        for i in range(n_simulations):
+            if distribution == 'normal':
+                path = np.random.normal(mu, sigma, n_trades)
+            
+            elif distribution == 't':
+                # Fit Student's t
+                df, loc, scale = stats.t.fit(self.returns)
+                path = stats.t.rvs(df, loc=loc, scale=scale, size=n_trades)
+            
+            elif distribution == 'mixture':
+                # Simple 2-component mixture
+                # 70% normal regime, 30% high-vol regime
+                regime = np.random.choice([0, 1], size=n_trades, p=[0.7, 0.3])
+                path = np.where(
+                    regime == 0,
+                    np.random.normal(mu, sigma, n_trades),
+                    np.random.normal(mu * 1.5, sigma * 2, n_trades)
+                )
+            
+            paths.append(path)
+        
+        self.simulated_paths = np.array(paths)
+        return self.simulated_paths
+    
+    # =========================================================
+    # 3. EQUITY CURVE ANALYSIS
+    # =========================================================
+    
+    def analyze_equity_paths(self):
+        """
+        Analyze distribution of equity curves
+        """
+        if not hasattr(self, 'simulated_paths'):
+            print("⚠️ Run bootstrap_paths() or parametric_paths() first")
+            return
+        
+        print("\n" + "="*80)
+        print("💰 EQUITY CURVE ANALYSIS")
+        print("="*80)
+        
+        # Build equity curves
+        equity_curves = np.zeros((len(self.simulated_paths), len(self.simulated_paths[0]) + 1))
+        equity_curves[:, 0] = self.initial_capital
+        
+        for i, path in enumerate(self.simulated_paths):
+            for j, ret in enumerate(path):
+                equity_curves[i, j+1] = equity_curves[i, j] * (1 + ret)
+        
+        self.equity_curves = equity_curves
+        
+        # Final equity distribution
+        final_equity = equity_curves[:, -1]
+        
+        print(f"\nFinal Equity Statistics (n={len(final_equity)}):")
+        print(f"  Mean:     ${final_equity.mean():,.2f}")
+        print(f"  Median:   ${np.median(final_equity):,.2f}")
+        print(f"  Std Dev:  ${final_equity.std():,.2f}")
+        print(f"  Min:      ${final_equity.min():,.2f}")
+        print(f"  Max:      ${final_equity.max():,.2f}")
+        
+        # Percentiles
+        percentiles = [5, 10, 25, 50, 75, 90, 95]
+        print("\nPercentiles:")
+        for p in percentiles:
+            val = np.percentile(final_equity, p)
+            print(f"  {p:>2}th: ${val:>10,.2f}")
+        
+        # Probability of profit
+        prob_profit = (final_equity > self.initial_capital).mean()
+        print(f"\nProbability of Profit: {prob_profit*100:.1f}%")
+        
+        return equity_curves
+    
+    # =========================================================
+    # 4. DRAWDOWN DISTRIBUTION
+    # =========================================================
+    
+    def analyze_drawdown_distribution(self):
+        """
+        What's the distribution of max drawdowns?
+        """
+        if not hasattr(self, 'equity_curves'):
+            self.analyze_equity_paths()
+        
+        print("\n" + "="*80)
+        print("📉 DRAWDOWN DISTRIBUTION ANALYSIS")
+        print("="*80)
+        
+        max_drawdowns = []
+        
+        for equity in self.equity_curves:
+            running_max = np.maximum.accumulate(equity)
+            drawdowns = (equity - running_max) / running_max * 100
+            max_drawdowns.append(drawdowns.min())
+        
+        max_drawdowns = np.array(max_drawdowns)
+        
+        print(f"\nMax Drawdown Statistics (n={len(max_drawdowns)}):")
+        print(f"  Mean:     {max_drawdowns.mean():.2f}%")
+        print(f"  Median:   {np.median(max_drawdowns):.2f}%")
+        print(f"  Std Dev:  {max_drawdowns.std():.2f}%")
+        print(f"  Worst:    {max_drawdowns.min():.2f}%")
+        print(f"  Best:     {max_drawdowns.max():.2f}%")
+        
+        # Risk levels
+        dd_5pct = np.percentile(max_drawdowns, 5)
+        dd_1pct = np.percentile(max_drawdowns, 1)
+        
+        print(f"\nTail Risk:")
+        print(f"  5th percentile (1-in-20):  {dd_5pct:.2f}%")
+        print(f"  1st percentile (1-in-100): {dd_1pct:.2f}%")
+        
+        # Historical comparison
+        historical_equity = [self.initial_capital]
+        for ret in self.returns:
+            historical_equity.append(historical_equity[-1] * (1 + ret))
+        
+        historical_equity = np.array(historical_equity)
+        running_max = np.maximum.accumulate(historical_equity)
+        historical_dd = ((historical_equity - running_max) / running_max * 100).min()
+        
+        print(f"\nHistorical Max DD: {historical_dd:.2f}%")
+        pct_worse = (max_drawdowns < historical_dd).mean()
+        print(f"Simulations worse than historical: {pct_worse*100:.1f}%")
+        
+        return max_drawdowns
+    
+    # =========================================================
+    # 5. RISK OF RUIN
+    # =========================================================
+    
+    def calculate_risk_of_ruin(self, ruin_threshold=0.5):
+        """
+        Probability of losing X% of capital
+        
+        ruin_threshold: fraction of capital (0.5 = -50%)
+        """
+        if not hasattr(self, 'equity_curves'):
+            self.analyze_equity_paths()
+        
+        print("\n" + "="*80)
+        print("💀 RISK OF RUIN ANALYSIS")
+        print("="*80)
+        
+        ruin_levels = [0.2, 0.3, 0.5, 0.7]
+        
+        for threshold in ruin_levels:
+            min_equity = self.equity_curves.min(axis=1)
+            ruin_prob = (min_equity < self.initial_capital * (1 - threshold)).mean()
+            
+            print(f"  Risk of {threshold*100:.0f}% drawdown: {ruin_prob*100:.2f}%")
+        
+        return ruin_prob
+    
+    # =========================================================
+    # 6. MONTE CARLO VISUALIZATION
+    # =========================================================
+    
+    def plot_monte_carlo_results(self, n_paths_display=100):
+        """
+        Comprehensive Monte Carlo visualization
+        """
+        if not hasattr(self, 'equity_curves'):
+            self.analyze_equity_paths()
+        
+        fig = plt.figure(figsize=(18, 12))
+        gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
+        
+        # 1. Equity curves (sample)
+        ax1 = fig.add_subplot(gs[0, :2])
+        sample_indices = np.random.choice(
+            len(self.equity_curves), 
+            size=min(n_paths_display, len(self.equity_curves)), 
+            replace=False
+        )
+        
+        for idx in sample_indices:
+            ax1.plot(self.equity_curves[idx], alpha=0.1, color='steelblue', linewidth=0.5)
+        
+        # Add percentile bands
+        p5 = np.percentile(self.equity_curves, 5, axis=0)
+        p50 = np.percentile(self.equity_curves, 50, axis=0)
+        p95 = np.percentile(self.equity_curves, 95, axis=0)
+        
+        ax1.plot(p50, color='darkblue', linewidth=2, label='Median')
+        ax1.fill_between(range(len(p5)), p5, p95, alpha=0.3, color='blue', label='5th-95th %ile')
+        ax1.axhline(self.initial_capital, color='red', linestyle='--', alpha=0.5)
+        ax1.set_title('Simulated Equity Paths', fontsize=12, fontweight='bold')
+        ax1.set_xlabel('Trade #')
+        ax1.set_ylabel('Equity ($)')
+        ax1.legend()
+        ax1.grid(alpha=0.3)
+        
+        # 2. Final equity distribution
+        ax2 = fig.add_subplot(gs[0, 2])
+        final_equity = self.equity_curves[:, -1]
+        ax2.hist(final_equity, bins=50, color='steelblue', alpha=0.7, edgecolor='black')
+        ax2.axvline(self.initial_capital, color='red', linestyle='--', linewidth=2, label='Initial')
+        ax2.axvline(final_equity.mean(), color='green', linestyle='--', linewidth=2, label='Mean')
+        ax2.set_title('Final Equity Distribution', fontsize=12, fontweight='bold')
+        ax2.set_xlabel('Final Equity ($)')
+        ax2.set_ylabel('Frequency')
+        ax2.legend()
+        ax2.grid(alpha=0.3)
+        
+        # 3. Drawdown distribution
+        ax3 = fig.add_subplot(gs[1, 0])
+        max_drawdowns = []
+        for equity in self.equity_curves:
+            running_max = np.maximum.accumulate(equity)
+            drawdowns = (equity - running_max) / running_max * 100
+            max_drawdowns.append(drawdowns.min())
+        
+        ax3.hist(max_drawdowns, bins=50, color='red', alpha=0.7, edgecolor='black')
+        ax3.axvline(np.median(max_drawdowns), color='darkred', linestyle='--', linewidth=2)
+        ax3.set_title('Max Drawdown Distribution', fontsize=12, fontweight='bold')
+        ax3.set_xlabel('Max Drawdown (%)')
+        ax3.set_ylabel('Frequency')
+        ax3.grid(alpha=0.3)
+        
+        # 4. Return distribution
+        ax4 = fig.add_subplot(gs[1, 1])
+        total_returns = (final_equity / self.initial_capital - 1) * 100
+        ax4.hist(total_returns, bins=50, color='green', alpha=0.7, edgecolor='black')
+        ax4.axvline(0, color='red', linestyle='--', linewidth=2)
+        ax4.axvline(total_returns.mean(), color='darkgreen', linestyle='--', linewidth=2)
+        ax4.set_title('Total Return Distribution', fontsize=12, fontweight='bold')
+        ax4.set_xlabel('Total Return (%)')
+        ax4.set_ylabel('Frequency')
+        ax4.grid(alpha=0.3)
+        
+        # 5. Probability cone
+        ax5 = fig.add_subplot(gs[1, 2])
+        percentiles = [1, 5, 25, 50, 75, 95, 99]
+        curves = {p: np.percentile(self.equity_curves, p, axis=0) for p in percentiles}
+        
+        ax5.fill_between(range(len(curves[1])), curves[1], curves[99], 
+                         alpha=0.2, color='red', label='1st-99th')
+        ax5.fill_between(range(len(curves[5])), curves[5], curves[95], 
+                         alpha=0.3, color='orange', label='5th-95th')
+        ax5.fill_between(range(len(curves[25])), curves[25], curves[75], 
+                         alpha=0.4, color='yellow', label='25th-75th')
+        ax5.plot(curves[50], color='darkblue', linewidth=2, label='Median')
+        ax5.axhline(self.initial_capital, color='red', linestyle='--', alpha=0.5)
+        ax5.set_title('Probability Cone', fontsize=12, fontweight='bold')
+        ax5.set_xlabel('Trade #')
+        ax5.set_ylabel('Equity ($)')
+        ax5.legend()
+        ax5.grid(alpha=0.3)
+        
+        # 6. Risk metrics table
+        ax6 = fig.add_subplot(gs[2, :])
+        ax6.axis('off')
+        
+        metrics_text = f"""
+        MONTE CARLO RISK METRICS (n={len(self.equity_curves)})
+        
+        Final Equity:
+          Mean:              ${final_equity.mean():,.0f}
+          Median:            ${np.median(final_equity):,.0f}
+          5th Percentile:    ${np.percentile(final_equity, 5):,.0f}
+          95th Percentile:   ${np.percentile(final_equity, 95):,.0f}
+        
+        Max Drawdown:
+          Mean:              {np.mean(max_drawdowns):.2f}%
+          Median:            {np.median(max_drawdowns):.2f}%
+          5th Percentile:    {np.percentile(max_drawdowns, 5):.2f}%
+          
+        Risk Metrics:
+          Probability of Profit:    {(final_equity > self.initial_capital).mean()*100:.1f}%
+          Risk of 50% Drawdown:     {(np.array(max_drawdowns) < -50).mean()*100:.2f}%
+        """
+        
+        ax6.text(0.1, 0.5, metrics_text, fontsize=10, verticalalignment='center',
+                fontfamily='monospace', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+        
+        plt.savefig('monte_carlo_analysis.png', dpi=150, bbox_inches='tight')
+        print("\n📊 Saved: monte_carlo_analysis.png")
+        plt.show()
+
+# =========================================================
+# USAGE EXAMPLE
+# =========================================================
+
+def run_enhanced_analysis(stress_csv='stress_test_results.csv', 
+                         trades_csv='walkforward_all_trades.csv'):
+    """
+    Complete enhanced analysis pipeline
+    """
+    
+    print("\n" + "="*80)
+    print("🚀 ENHANCED STRESS TEST & MONTE CARLO ANALYSIS")
+    print("="*80)
+    
+    # =========================================================
+    # PART 1: STRESS TEST DEEP DIVE
+    # =========================================================
+    
+    print("\n📂 Loading stress test results...")
+    stress_df = pd.read_csv(stress_csv)
+    
+    analyzer = StressTestAnalyzer(stress_df)
+    
+    # Run all analyses
+    print("\n" + "="*80)
+    print("PART 1: DEEP STRESS TEST EXTRACTION")
+    print("="*80)
+    
+    interaction_df = analyzer.analyze_parameter_interactions()
+    analyzer.analyze_regime_consistency()
+    analyzer.decompose_tail_risk()
+    pareto_points = analyzer.plot_efficiency_frontier()
+    analyzer.plot_metric_correlations()
+    
+    # =========================================================
+    # PART 2: MONTE CARLO SIMULATION
+    # =========================================================
+    
+    print("\n" + "="*80)
+    print("PART 2: MONTE CARLO SIMULATION")
+    print("="*80)
+    
+    print("\n📂 Loading trade history...")
+    trades_df = pd.read_csv(trades_csv, index_col=0, parse_dates=True)
+    
+    mc = MonteCarloSimulator(trades_df, initial_capital=10000)
+    
+    # Bootstrap simulation
+    print("\n--- Bootstrap Simulation ---")
+    mc.bootstrap_paths(n_simulations=1000)
+    mc.analyze_equity_paths()
+    mc.analyze_drawdown_distribution()
+    mc.calculate_risk_of_ruin()
+    mc.plot_monte_carlo_results()
+    
+    # Parametric simulation with fat tails
+    print("\n--- Parametric Simulation (Student's t) ---")
+    mc.parametric_paths(n_simulations=1000, distribution='t')
+    mc.analyze_equity_paths()
+    mc.analyze_drawdown_distribution()
+    mc.calculate_risk_of_ruin()
+    
+    print("\n" + "="*80)
+    print("✅ ENHANCED ANALYSIS COMPLETE")
+    print("="*80)
+    
+    return analyzer, mc
+
+if __name__ == "__main__":
+    print(__doc__)
+    print("\n🎯 To run enhanced analysis:")
+    print("  >>> analyzer, mc = run_enhanced_analysis()")
+    print("\nOr run components separately:")
+    print("  >>> stress_df = pd.read_csv('stress_test_results.csv')")
+    print("  >>> analyzer = StressTestAnalyzer(stress_df)")
+    print("  >>> analyzer.analyze_parameter_interactions()")
+    print("  >>> analyzer.plot_efficiency_frontier()")
+    print("\n  >>> trades_df = pd.read_csv('walkforward_all_trades.csv', index_col=0, parse_dates=True)")
+    print("  >>> mc = MonteCarloSimulator(trades_df)")
+    print("  >>> mc.bootstrap_paths(n_simulations=1000)")
+    print("  >>> mc.plot_monte_carlo_results()")
+
+
+
+# =========================================================
+# USAGE EXAMPLE
+# =========================================================
+if __name__ == "__main__":
+    # After your stress test completes:
+    # stress_df = pd.read_csv("stress_test_results.csv")
+    # run_stress_dashboard(stress_df)
+
+    print("\n📖 Stress Test Dashboard Module Loaded")
+    print("\nTo use after stress test completes:")
+    print("  >>> stress_df = pd.read_csv('stress_test_results.csv')")
+    print("  >>> run_stress_dashboard(stress_df)")
+# =========================================================
+# MAIN EXECUTION
+# =========================================================
+
+def main():
+    """
+    SINGLE SOURCE OF TRUTH EXECUTION PIPELINE
+    ----------------------------------------
+    - Walk-forward backtest
+    - Stress grid
+    - Dashboards
+    - Deep stress analysis
+    - Monte Carlo
+    """
+
+    # =========================================================
+    # CONFIG
+    # =========================================================
+    start = datetime(2010, 1, 5)
+    end   = datetime(2024, 12, 5)
+    instrument = INSTRUMENT_FX_MAJORS_AUD_USD
+
+    interval   = dukascopy_python.INTERVAL_HOUR_1
+    offer_side = dukascopy_python.OFFER_SIDE_BID
+
+    # =========================================================
+    # STEP 1: DATA
+    # =========================================================
+    print("\n🚀 DOWNLOADING DATA")
+    df_raw = get_dukascopy_chunked(
+        instrument, start, end, interval, offer_side, chunk_months=1
+    )
+    if df_raw.empty:
+        raise RuntimeError("No data downloaded")
+
+    df_raw.to_csv("AUDUSD_raw.csv", index=False)
+
+    # =========================================================
+    # STEP 2: FEATURES
+    # =========================================================
+    print("\n🔄 COMPUTING FEATURES")
+    features = compute_features_optimized(df_raw)
+    features.to_csv("AUDUSD_features.csv", index=False)
+
+    # =========================================================
+    # STEP 3: SIGNAL STATES
+    # =========================================================
+    df_features, state_features = extract_signal_states(
+        features, lookback=50
+    )
+
+    # =========================================================
+    # STEP 4: WALK-FORWARD BACKTEST
+    # =========================================================
+    print("\n🧠 WALK-FORWARD BACKTEST")
+    wf = WalkForwardBacktestAnalyzer(
+        initial_capital=10000,
+        risk_free_rate=0.02
+    )
+
+    metrics = wf.walk_forward_analyze(
+        df=df_features,
+        state_features=state_features,
+        train_periods=12,
+        test_periods=3,
+        lookback_bars=20,
+        n_states=4,
+        min_win_rate=0.30,
+        min_trades=5,
+        forward_bars=100,
+        stop_loss_pct=0.001,
+        take_profit_pct=0.003
+    )
+
+    wf.print_report()
+    wf.plot_walk_forward_results()
+
+    wf.trades.to_csv("walkforward_all_trades.csv", index=False)
+    pd.DataFrame(wf.fold_metrics).to_csv(
+        "walkforward_fold_results.csv", index=False
+    )
+
+    # =========================================================
+    # STEP 5: STRESS TEST GRID (PARALLEL)
+    # =========================================================
+    print("\n🔥 STRESS TEST GRID")
+    results = []
+
+    keys = list(STRESS_GRID.keys())
+    param_combos = [
+        dict(zip(keys, v))
+        for v in product(*STRESS_GRID.values())
+    ]
+
+    with ProcessPoolExecutor(max_workers=4) as ex:
+        futures = [
+            ex.submit(
+                run_experiment_wrapper,
+                (df_features, state_features, p)
+            )
+            for p in param_combos
+        ]
+
+        for f in as_completed(futures):
+            res = f.result()
+            if res is not None:
+                results.append(res)
+
+    stress_df = pd.DataFrame(results)
+    stress_df.to_csv("stress_test_results.csv", index=False)
+
+    # =========================================================
+    # STEP 6: STRESS DASHBOARD (TEXT + HEATMAPS)
+    # =========================================================
+    print("\n📊 STRESS DASHBOARD")
+    print_stress_dashboard(stress_df)
+    plot_stress_heatmaps(stress_df)
+    plot_parameter_sensitivity(stress_df)
+
+    # =========================================================
+    # STEP 7: DEEP STRESS ANALYSIS
+    # =========================================================
+    print("\n🧬 DEEP STRESS ANALYSIS")
+    analyzer = StressTestAnalyzer(stress_df)
+    analyzer.analyze_parameter_interactions()
+    analyzer.analyze_regime_consistency()
+    analyzer.decompose_tail_risk()
+    analyzer.plot_efficiency_frontier()
+    analyzer.plot_metric_correlations()
+
+    # =========================================================
+    # STEP 8: MONTE CARLO
+    # =========================================================
+    print("\n🎲 MONTE CARLO SIMULATION")
+    trades_df = pd.read_csv("walkforward_all_trades.csv")
+
+    mc = MonteCarloSimulator(trades_df, initial_capital=10000)
+    mc.bootstrap_paths(n_simulations=1000)
+    mc.analyze_equity_paths()
+    mc.analyze_drawdown_distribution()
+    mc.calculate_risk_of_ruin()
+    mc.plot_monte_carlo_results()
+
+    print("\n✅ FULL PIPELINE COMPLETE")
+
+
+if __name__ == "__main__":
+    main()
+
+
